@@ -1,7 +1,0 @@
-streamlit
-pandas
-numpy
-tempfile
-pdfplumber
-tabula
-rapidfuzz
