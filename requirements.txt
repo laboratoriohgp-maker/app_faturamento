@@ -1,7 +1,6 @@
 streamlit
 pandas
 numpy
-tempfile
 pdfplumber
-tabula
+tabula-py
 rapidfuzz
