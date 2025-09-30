@@ -4,3 +4,4 @@ numpy
 pdfplumber
 tabula-py
 rapidfuzz
+openpyxl
