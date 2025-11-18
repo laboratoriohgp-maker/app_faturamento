@@ -1177,7 +1177,7 @@ st.markdown("""
     <p>Versão 2.0 - Melhorado com múltiplos algoritmos e análise financeira</p>
     <p>💡 <em>Dica: Use o menu lateral para ajustar parâmetros de matching</em></p>
 </div>
-""", unsafe_allow_html=True), '').str.replace('.', '').str.replace(',', '.').str.strip()
+""", unsafe_allow_html=True), (',').str.replace('.', '').str.replace(',', '.').str.strip()
 lab['valor_lab'] = pd.to_numeric(lab['valor_lab'], errors='coerce')
 
 # Adicionar material se existir
