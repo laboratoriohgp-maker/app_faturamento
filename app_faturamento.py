@@ -329,7 +329,7 @@ else:
 # Parse valores se existirem
 if lab_value_col:
     # Limpar e converter valores (pode vir como "R$ 123,45")
-    lab['valor_lab'] = lab[lab_value_col].astype(str).str.replace('R$')
+    lab['valor_lab'] = lab[lab_value_col].astype(str).str.replace('R
 
 # Date filtering
 if start_date and end_date and start_date > end_date:
@@ -363,19 +363,34 @@ if detect_dups:
     duplicates_mv = detect_duplicates(mv, dup_cols)
     duplicates_lab = detect_duplicates(lab, dup_cols)
 
-# Aggregates - agora sem valor_mv já que MV não tem
-agg_mv = mv.groupby(['atendimento_id', 'paciente_norm', 'exame_norm']).agg({
-    'ts_mv': 'first',
-    **({'solicitante': 'first'} if mv_solicitante_col else {}),
-    **({'local': 'first'} if mv_local_col else {})
-}).reset_index()
+# Aggregates - verificar se colunas existem antes de agregar
+agg_mv_dict = {'ts_mv': 'first'} if 'ts_mv' in mv.columns else {}
+if mv_solicitante_col and 'solicitante' in mv.columns:
+    agg_mv_dict['solicitante'] = 'first'
+if mv_local_col and 'local' in mv.columns:
+    agg_mv_dict['local'] = 'first'
+
+if agg_mv_dict:
+    agg_mv = mv.groupby(['atendimento_id', 'paciente_norm', 'exame_norm']).agg(agg_mv_dict).reset_index()
+else:
+    agg_mv = mv.groupby(['atendimento_id', 'paciente_norm', 'exame_norm']).size().reset_index(name='_temp')
+    agg_mv = agg_mv.drop('_temp', axis=1)
+
 agg_mv['qtd_mv'] = mv.groupby(['atendimento_id', 'paciente_norm', 'exame_norm']).size().values
 
-agg_lab = lab.groupby(['atendimento_id', 'paciente_norm', 'exame_norm']).agg({
-    'ts_lab': 'first',
-    **({'valor_lab': 'sum'} if lab_value_col else {}),
-    **({'material': 'first'} if lab_material_col else {})
-}).reset_index()
+# Aggregates Lab
+agg_lab_dict = {'ts_lab': 'first'} if 'ts_lab' in lab.columns else {}
+if lab_value_col and 'valor_lab' in lab.columns:
+    agg_lab_dict['valor_lab'] = 'sum'
+if lab_material_col and 'material' in lab.columns:
+    agg_lab_dict['material'] = 'first'
+
+if agg_lab_dict:
+    agg_lab = lab.groupby(['atendimento_id', 'paciente_norm', 'exame_norm']).agg(agg_lab_dict).reset_index()
+else:
+    agg_lab = lab.groupby(['atendimento_id', 'paciente_norm', 'exame_norm']).size().reset_index(name='_temp')
+    agg_lab = agg_lab.drop('_temp', axis=1)
+
 agg_lab['qtd_lab'] = lab.groupby(['atendimento_id', 'paciente_norm', 'exame_norm']).size().values
 
 # ---------------------- Matching Logic ----------------------
@@ -1177,8 +1192,8 @@ st.markdown("""
     <p>Versão 2.0 - Melhorado com múltiplos algoritmos e análise financeira</p>
     <p>💡 <em>Dica: Use o menu lateral para ajustar parâmetros de matching</em></p>
 </div>
-""", unsafe_allow_html=True), (',').str.replace('.', '').str.replace(',', '.').str.strip()
-lab['valor_lab'] = pd.to_numeric(lab['valor_lab'], errors='coerce')
+""", unsafe_allow_html=True), '').str.replace('.', '').str.replace(',', '.').str.strip()
+    lab['valor_lab'] = pd.to_numeric(lab['valor_lab'], errors='coerce')
 
 # Adicionar material se existir
 if lab_material_col:
