@@ -329,7 +329,7 @@ else:
 # Parse valores se existirem
 if lab_value_col:
     # Limpar e converter valores (pode vir como "R$ 123,45")
-    lab['valor_lab'] = lab[lab_value_col].astype(str).str.replace('R
+    lab['valor_lab'] = lab[lab_value_col].astype(str).str.replace('R$')
 
 # Date filtering
 if start_date and end_date and start_date > end_date:
@@ -1178,7 +1178,7 @@ st.markdown("""
     <p>💡 <em>Dica: Use o menu lateral para ajustar parâmetros de matching</em></p>
 </div>
 """, unsafe_allow_html=True), '').str.replace('.', '').str.replace(',', '.').str.strip()
-    lab['valor_lab'] = pd.to_numeric(lab['valor_lab'], errors='coerce')
+lab['valor_lab'] = pd.to_numeric(lab['valor_lab'], errors='coerce')
 
 # Adicionar material se existir
 if lab_material_col:
