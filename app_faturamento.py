@@ -1,267 +1,353 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import io
-import re
+import unicodedata
 import os
-import tempfile
-import pdfplumber
-import tabula
-from rapidfuzz import fuzz, process
+from datetime import datetime
+import matplotlib.pyplot as plt
+import plotly.express as px
+from fpdf import FPDF
 
-st.set_page_config(layout="wide", page_title="Conferência de Faturamento")
+st.set_page_config(layout="wide", page_title="App Faturamento - Avançado", page_icon="🔬")
 
-# ---------------------------
-# Utils
-# ---------------------------
-def normalize_code(s: str):
-    if pd.isna(s): return None
-    s = str(s).strip()
-    s = re.sub(r"[^\d\.\-]", "", s)  # mantém apenas dígitos, ponto, hífen
+# ---------------------- Utilitários ----------------------
+
+def normalize_text(s):
+    if pd.isna(s): return ""
+    if not isinstance(s, str): s = str(s)
+    s = s.strip().upper()
+    s = unicodedata.normalize('NFKD', s)
+    s = ''.join([c for c in s if not unicodedata.combining(c)])
     return s
 
-def parse_pdf_bytes_tabula(pdf_bytes: bytes, file_name="arquivo.pdf"):
-    """ Extrai tabelas de PDF usando tabula-py (requer Java). """
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(pdf_bytes)
-        tmp_path = tmp.name
-    try:
-        dfs = tabula.read_pdf(tmp_path, pages="all", multiple_tables=True, lattice=True)
-        if not dfs:
-            return pd.DataFrame()
-        df = pd.concat(dfs, ignore_index=True)
-        df["__source_file"] = file_name
-        return df
-    except Exception as e:
-        st.error(f"Erro extraindo tabelas do PDF {file_name}: {e}")
-        return pd.DataFrame()
-    finally:
-        os.remove(tmp_path)
+def token_set_ratio(a, b):
+    if not a and not b: return 100
+    sa = set(a.split())
+    sb = set(b.split())
+    if not sa or not sb: return 0
+    return int(len(sa.intersection(sb)) / len(sa.union(sb)) * 100)
 
-def parse_excel_file_bytes_to_df(excel_bytes: bytes):
-    try:
-        xls = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=None)
-        dfs = []
-        for name, df in xls.items():
-            df["__sheet_name"] = name
-            dfs.append(df)
-        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-    except Exception as e:
-        st.error(f"Erro lendo Excel: {e}")
-        return pd.DataFrame()
+# canonicalize exam using synonyms mapping (dict)
+def canonical_exam(name, synonyms_map=None):
+    if not name: return name
+    n = normalize_text(name)
+    if synonyms_map:
+        if n in synonyms_map:
+            return synonyms_map[n]
+        # try exact token match
+        for k,v in synonyms_map.items():
+            if token_set_ratio(k, n) > 90:
+                return v
+    return n
 
-def aggregate_codes_from_df(df, code_col_candidates=None, qty_col_candidates=None):
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["codigo","descricao","quant_total"])
-    dfc = df.copy()
+# detect datetime col heuristics
+def detect_datetime_col(df):
+    for c in df.columns:
+        low = c.lower()
+        if "data" in low and "hora" in low:
+            return c
+    for c in df.columns:
+        low = c.lower()
+        if any(w in low for w in ["data","hora","timestamp","ts","date","time"]):
+            return c
+    return None
 
-    # detectar colunas
-    code_col = None
-    qty_col = None
-    desc_col = None
+# find col
+def find_col(df, keywords):
+    cols = list(df.columns)
+    low = [c.lower() for c in cols]
+    for kw in keywords:
+        for i, lc in enumerate(low):
+            if kw in lc:
+                return cols[i]
+    return None
 
-    for cand in (code_col_candidates or ["NC","CÓDIGO","CODIGO","codigo","cod","procedimento"]):
-        for c in dfc.columns:
-            if cand.lower() in str(c).lower():
-                code_col = c; break
-        if code_col: break
+# ---------------------- Sidebar / config ----------------------
+st.sidebar.title("Configuração")
+uploaded_synonyms = st.sidebar.file_uploader("(Opcional) Upload synonyms.csv (colunas: synonym,canonical)", type=["csv"]) 
+use_rapidfuzz = st.sidebar.checkbox("Usar rapidfuzz (se instalado) para matching mais veloz", value=False)
 
-    for cand in (qty_col_candidates or ["QUANT","QTD","QUANTIDADE","quantidade","qtde"]):
-        for c in dfc.columns:
-            if cand.lower() in str(c).lower():
-                qty_col = c; break
-        if qty_col: break
+# matching weights
+st.sidebar.markdown("**Pesos para matching**")
+weight_patient = st.sidebar.slider("Peso nome paciente", 0.0, 1.0, 0.6)
+weight_exam = st.sidebar.slider("Peso exame", 0.0, 1.0, 0.4)
 
-    for cand in ["DESCRIÇÃO","DESCRICAO","descricao","exame","procedimento","item","nome"]:
-        for c in dfc.columns:
-            if cand.lower() in str(c).lower():
-                desc_col = c; break
-        if desc_col: break
+# filters defaults
+tolerance = st.sidebar.number_input("Tolerância (minutos) p/ atraso", min_value=0, value=130)
+fuzzy_threshold = st.sidebar.slider("Threshold token-set p/ pareamento (0-100)", 30, 100, 60)
 
-    rows = []
-    for _, r in dfc.iterrows():
-        codigo = normalize_code(r.get(code_col)) if code_col else None
-        qty = None
-        if qty_col and not pd.isna(r.get(qty_col)):
-            try:
-                qty = int(r.get(qty_col))
-            except:
-                pass
-        desc = r.get(desc_col) if desc_col else None
-        rows.append({"codigo": codigo, "descricao": desc, "quant_total": qty})
+# date filter
+st.sidebar.markdown("---")
+start_date = st.sidebar.date_input("Data início (opcional)", value=None)
+end_date = st.sidebar.date_input("Data fim (opcional)", value=None)
 
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out
+# ---------------------- Main UI ----------------------
+st.title("🔬 App Faturamento — MV x Laboratório (Avançado)")
+st.markdown("Use as abas abaixo.
 
-    out = out.groupby("codigo", dropna=False).agg({
-        "descricao": lambda x: "; ".join(pd.unique(x.dropna().astype(str))) if x.notna().any() else None,
-        "quant_total": lambda x: int(np.nansum([v for v in x if pd.notna(v)])) if any(pd.notna(x)) else None
-    }).reset_index()
-    return out
-
-def to_excel_bytes(df_dict):
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        for name, df in df_dict.items():
-            df.to_excel(writer, sheet_name=name[:31], index=False)
-        writer.save()
-    return out.getvalue()
-
-def fuzzy_match_list(base_list, compare_list, cutoff=85):
-    """Faz fuzzy matching entre duas listas de strings"""
-    matches = []
-    for item in base_list:
-        best = process.extractOne(item, compare_list, scorer=fuzz.token_sort_ratio)
-        if best and best[1] >= cutoff:
-            matches.append({"item": item, "match": best[0], "score": best[1]})
-        else:
-            matches.append({"item": item, "match": None, "score": None})
-    return pd.DataFrame(matches)
-
-# ---------------------------
-# Streamlit UI
-# ---------------------------
-st.title("📊 Conferência de Faturamento")
-
-st.markdown("""
-Faça upload da **planilha do sistema MV** (Excel) como referência principal, e depois envie os demais arquivos (PDF/Excel) contendo:
-- Relatório de Produção (códigos e quantidades)
-- Relatório Nominal (paciente + exame)
-- Relatório de Faturamento / Locação
-""")
-
-with st.sidebar:
-    st.header("Configurações")
-    fuzzy_cutoff = st.slider("Fuzzy cutoff para nomes", 60, 100, 85)
+**Importante:** carregue as planilhas MV e Laboratório.
+Você pode também enviar um arquivo de sinônimos para melhorar o matching.")
 
 # Uploads
-mv_file = st.file_uploader("📂 Upload - Planilha MV (Excel)", type=["xlsx","xls"])
-other_files = st.file_uploader("📂 Upload - Outros arquivos (PDF/Excel)", type=["pdf","xlsx","xls"], accept_multiple_files=True)
+col1, col2 = st.columns(2)
+with col1:
+    uploaded_mv = st.file_uploader("Planilha MV (solicitações)", type=["xlsx","xls","csv"], key='mv')
+with col2:
+    uploaded_lab = st.file_uploader("Planilha Laboratório (realizações)", type=["xlsx","xls","csv"], key='lab')
 
-if not mv_file:
-    st.warning("Envie a planilha MV para começar.")
+# load synonyms
+syn_map = None
+if uploaded_synonyms is not None:
+    try:
+        df_syn = pd.read_csv(uploaded_synonyms)
+        # expect columns 'synonym' and 'canonical'
+        syn_map = {normalize_text(r['synonym']): normalize_text(r['canonical']) for _, r in df_syn.iterrows()}
+        st.sidebar.success(f"Loaded {len(syn_map)} synonyms")
+    except Exception as e:
+        st.sidebar.error(f"Erro lendo synonyms: {e}")
+
+# Require uploads
+if not (uploaded_mv and uploaded_lab):
+    st.info("Carregue as duas planilhas para começar a análise.")
     st.stop()
 
-# Processa MV
+# ---------------------- Read files ----------------------
 try:
-    mv_df = pd.read_excel(mv_file)
-    st.write("Pré-visualização MV:")
-    st.dataframe(mv_df.head(10))
+    mv = pd.read_excel(uploaded_mv) if str(uploaded_mv).lower().endswith(('xlsx','xls')) else pd.read_csv(uploaded_mv)
+    lab = pd.read_excel(uploaded_lab) if str(uploaded_lab).lower().endswith(('xlsx','xls')) else pd.read_csv(uploaded_lab)
 except Exception as e:
-    st.error(f"Erro ao abrir MV: {e}")
+    st.error(f"Erro lendo arquivos: {e}")
     st.stop()
 
-# detectar colunas MV
-cand_code = next((c for c in mv_df.columns if any(k in c.lower() for k in ["codigo","nc","proced","cod"])), None)
-cand_qty  = next((c for c in mv_df.columns if any(k in c.lower() for k in ["quant","qtd","realiz"])), None)
-cand_desc = next((c for c in mv_df.columns if any(k in c.lower() for k in ["descr","exame","proced"])), None)
-cand_name = next((c for c in mv_df.columns if any(k in c.lower() for k in ["nome","paciente"])), None)
+# auto-detect columns
+mv_patient_col = find_col(mv, ['paciente','nome'])
+mv_exam_col    = find_col(mv, ['exame','proced','procedimento'])
+mv_id_col      = find_col(mv, ['atendimento','id_atend','numero_atendimento','num_atend'])
+mv_time_col    = detect_datetime_col(mv)
 
-mv_work = mv_df.copy()
-mv_work["codigo_norm"] = mv_work[cand_code].astype(str).apply(normalize_code) if cand_code else None
-mv_work["quant_mv"] = pd.to_numeric(mv_work[cand_qty], errors="coerce").fillna(0).astype(int) if cand_qty else 0
-if cand_desc: mv_work["desc_mv"] = mv_work[cand_desc].astype(str)
-if cand_name: mv_work["nome_mv"] = mv_work[cand_name].astype(str)
+lab_patient_col = find_col(lab, ['paciente','nome'])
+lab_exam_col    = find_col(lab, ['exame','proced','procedimento'])
+lab_id_col      = find_col(lab, ['atendimento','id_atend','numero_atendimento'])
+lab_time_col    = detect_datetime_col(lab)
 
-agg_mv = mv_work.groupby("codigo_norm", dropna=False).agg({
-    "desc_mv": lambda x: "; ".join(pd.unique(x.dropna().astype(str))) if x.notna().any() else None,
-    "quant_mv": "sum"
-}).reset_index().rename(columns={"codigo_norm":"codigo"})
+if mv_patient_col is None or mv_exam_col is None:
+    st.error("Não foi possível identificar colunas essenciais na planilha MV (paciente/exame). Renomeie ou verifique o arquivo.")
+    st.stop()
 
-# ---------------------------
-# Processa demais arquivos
-# ---------------------------
-all_extracted = []
-nominal_dfs = []
+# normalize and canonicalize
+mv['paciente_norm'] = mv[mv_patient_col].apply(normalize_text)
+mv['exame_norm'] = mv[mv_exam_col].apply(lambda x: canonical_exam(x, syn_map))
+mv['atendimento_id'] = mv[mv_id_col].astype(str) if mv_id_col else ''
+mv['ts_mv'] = pd.to_datetime(mv[mv_time_col], errors='coerce', dayfirst=True) if mv_time_col else pd.NaT
 
-for f in other_files:
-    st.write(f"➡️ Processando: {f.name}")
-    b = f.read()
-    if f.name.lower().endswith(".pdf"):
-        df_pdf = parse_pdf_bytes_tabula(b, f.name)
-        if not df_pdf.empty:
-            st.write("Preview PDF extraído:")
-            st.dataframe(df_pdf.head(10))
-            # Detecta se é nominal
-            if any("paciente" in str(c).lower() for c in df_pdf.columns):
-                nominal_dfs.append(df_pdf)
+lab['paciente_norm'] = lab[lab_patient_col].apply(normalize_text) if lab_patient_col else ''
+lab['exame_norm'] = lab[lab_exam_col].apply(lambda x: canonical_exam(x, syn_map)) if lab_exam_col else ''
+lab['atendimento_id'] = lab[lab_id_col].astype(str) if lab_id_col else ''
+lab['ts_lab'] = pd.to_datetime(lab[lab_time_col], errors='coerce', dayfirst=True) if lab_time_col else pd.NaT
+
+# optional date filter
+if start_date and end_date and start_date > end_date:
+    st.error("Data início é maior que data fim.")
+
+if start_date:
+    mv = mv[mv['ts_mv'].dt.date >= start_date] if 'ts_mv' in mv else mv
+    lab = lab[lab['ts_lab'].dt.date >= start_date] if 'ts_lab' in lab else lab
+if end_date:
+    mv = mv[mv['ts_mv'].dt.date <= end_date] if 'ts_mv' in mv else mv
+    lab = lab[lab['ts_lab'].dt.date <= end_date] if 'ts_lab' in lab else lab
+
+# aggregates
+agg_mv = mv.groupby(['atendimento_id','paciente_norm','exame_norm']).size().reset_index(name='qtd_mv')
+agg_lab = lab.groupby(['atendimento_id','paciente_norm','exame_norm']).size().reset_index(name='qtd_lab')
+
+# UI - tabs
+tab1, tab2, tab3, tab4 = st.tabs(["Dashboard","Comparação","Auditoria Manual","Export & PDF"])
+
+# ---------------------- Dashboard ----------------------
+with tab1:
+    st.header("📈 Dashboard")
+    col1, col2, col3 = st.columns(3)
+    total_solicitados = len(mv)
+    total_realizados = len(lab)
+    not_realizados_abs = total_solicitados - total_realizados
+    pct_not_realizados = not_realizados_abs / max(1, total_solicitados) * 100
+
+    # time matching quick heuristic (for KPIs)
+    # group lab by first token for speed
+    lab_first = {}
+    for _, r in lab.iterrows():
+        key = r['exame_norm'].split()[0] if isinstance(r['exame_norm'], str) and r['exame_norm'].split() else ''
+        lab_first.setdefault(key, []).append(r)
+
+    # compute time deltas for sample
+    time_deltas = []
+    for _, r in mv.iterrows():
+        key = r['exame_norm'].split()[0] if isinstance(r['exame_norm'], str) and r['exame_norm'].split() else ''
+        candidates = lab_first.get(key, [])
+        candidates = [c for c in candidates if token_set_ratio(c['paciente_norm'], r['paciente_norm']) >= fuzzy_threshold]
+        if not candidates:
+            continue
+        cand_with_ts = [c for c in candidates if pd.notna(c['ts_lab']) and pd.notna(r['ts_mv'])]
+        if not cand_with_ts:
+            continue
+        best = min(cand_with_ts, key=lambda x: abs((x['ts_lab'] - r['ts_mv']).total_seconds()))
+        delta = (best['ts_lab'] - r['ts_mv']).total_seconds() / 60.0
+        time_deltas.append(delta)
+
+    avg_delta = sum(time_deltas)/len(time_deltas) if time_deltas else None
+    atrasos_count = len([d for d in time_deltas if d > tolerance])
+    pct_atraso = atrasos_count / max(1, len(time_deltas)) * 100 if time_deltas else 0
+
+    col1.metric("Solicitados", total_solicitados)
+    col2.metric("Realizados", total_realizados)
+    col3.metric("% Não realizados", f"{pct_not_realizados:.2f}% ({not_realizados_abs})")
+
+    st.markdown("---")
+    st.subheader("Distribuição de solicitações por exame (Top 20)")
+    top_exams = agg_mv.groupby('exame_norm').agg(solicitados=('qtd_mv','sum')).reset_index().sort_values('solicitados', ascending=False).head(20)
+    fig = px.bar(top_exams, x='solicitados', y='exame_norm', orientation='h', height=500, labels={'exame_norm':'Exame','solicitados':'Solicitações'})
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Tempo de resposta — distribuição")
+    if time_deltas:
+        fig2 = px.histogram(pd.DataFrame({'delta_min': time_deltas}), x='delta_min', nbins=50, title='Distribuição do tempo (min)')
+        st.plotly_chart(fig2, use_container_width=True)
+    else:
+        st.info("Sem pares temporais suficientes para plotar distribuição de tempos")
+
+# ---------------------- Comparação ----------------------
+with tab2:
+    st.header("🔍 Comparação detalhada MV x Laboratório")
+
+    # allow exam filter here too
+    exams = sorted(agg_mv['exame_norm'].unique())
+    sel_exams = st.multiselect("Filtrar exames (opcional)", exams, default=None, key='comp_exams')
+    mv_f = mv.copy()
+    lab_f = lab.copy()
+    if sel_exams:
+        mv_f = mv_f[mv_f['exame_norm'].isin(sel_exams)]
+        lab_f = lab_f[lab_f['exame_norm'].isin(sel_exams)]
+
+    # Build fast index of lab aggregates by first token
+    lab_by_first = {}
+    for _, r in agg_lab.iterrows():
+        first = r['exame_norm'].split()[0] if r['exame_norm'] else ''
+        lab_by_first.setdefault(first, []).append(r)
+
+    matches = []
+    for _, row in agg_mv.iterrows():
+        exame = row['exame_norm']
+        exact = agg_lab[(agg_lab['exame_norm']==exame) & (agg_lab['paciente_norm']==row['paciente_norm'])]
+        if not exact.empty:
+            matches.append({'paciente_mv': row['paciente_norm'],'exame_mv': exame, 'qtd_mv': int(row['qtd_mv']), 'qtd_lab': int(exact['qtd_lab'].sum()), 'score':100})
+            continue
+        first = exame.split()[0] if exame else ''
+        candidates = lab_by_first.get(first, [])
+        if not candidates:
+            candidates = agg_lab.sample(n=min(80, len(agg_lab)), random_state=1).to_dict('records')
+        best_score=-1; best_q=0
+        for c in candidates:
+            sp = token_set_ratio(row['paciente_norm'], c['paciente_norm'])
+            se = token_set_ratio(exame, c['exame_norm'])
+            score = int(sp*weight_patient + se*weight_exam)
+            if score>best_score:
+                best_score=score; best_q=int(c['qtd_lab'])
+        matches.append({'paciente_mv': row['paciente_norm'],'exame_mv': exame,'qtd_mv': int(row['qtd_mv']),'qtd_lab': best_q,'score':best_score})
+
+    comp_df = pd.DataFrame(matches)
+    comp_df['diff'] = comp_df['qtd_mv'] - comp_df['qtd_lab']
+    comp_df['status'] = comp_df['diff'].apply(lambda d: 'OK' if d==0 else ('FALTAM' if d>0 else 'EXCESSO'))
+
+    st.subheader("Resumo agregado")
+    c1, c2 = st.columns(2)
+    c1.write(comp_df['status'].value_counts())
+    c2.write(comp_df[['qtd_mv','qtd_lab']].sum())
+
+    st.subheader("Top divergências")
+    top_div = comp_df[comp_df['diff']>0].sort_values('diff', ascending=False).head(20)
+    if not top_div.empty:
+        fig3 = px.bar(top_div, x='diff', y='exame_mv', orientation='h', title='Top divergências (faltam no Lab)')
+        st.plotly_chart(fig3, use_container_width=True)
+    else:
+        st.info("Nenhuma divergência positiva detectada no filtro atual")
+
+    st.subheader("Tabela de comparação (editar/filtrar)")
+    st.dataframe(comp_df.sort_values(['status','score'], ascending=[True,False]).head(500))
+
+# ---------------------- Auditoria Manual ----------------------
+with tab3:
+    st.header("🧪 Auditoria manual — revisar e corrigir pares")
+    st.write("Nesta aba você pode revisar correspondências com baixa similaridade e marcar decisões. As alterações serão salvas no log de auditoria.")
+
+    # pick candidates with low score
+    review_candidates = comp_df[comp_df['score'] < max(60, fuzzy_threshold)].copy()
+    if review_candidates.empty:
+        st.info("Não há candidatos com pontuação baixa para revisar — ajuste filtros ou threshold.")
+    else:
+        st.write(f"{len(review_candidates)} registros para revisão (score baixo)")
+        # allow editing via data_editor
+        edited = st.data_editor(review_candidates, num_rows="dynamic")
+        # decision column: user can change 'qtd_lab' or 'status' to correct
+        if st.button("Salvar decisões de auditoria"):
+            # append to audit log file
+            log_fname = 'audit_log.csv'
+            edited['review_ts'] = datetime.now()
+            if os.path.exists(log_fname):
+                pd.concat([pd.read_csv(log_fname), edited]).to_csv(log_fname, index=False)
             else:
-                agg = aggregate_codes_from_df(df_pdf)
-                if not agg.empty:
-                    agg["fonte"] = f.name
-                    all_extracted.append(agg)
-    elif f.name.lower().endswith((".xlsx",".xls")):
-        df_excel = parse_excel_file_bytes_to_df(b)
-        st.write("Preview Excel:")
-        st.dataframe(df_excel.head(10))
-        if any("paciente" in str(c).lower() for c in df_excel.columns):
-            nominal_dfs.append(df_excel)
-        else:
-            agg = aggregate_codes_from_df(df_excel)
-            if not agg.empty:
-                agg["fonte"] = f.name
-                all_extracted.append(agg)
+                edited.to_csv(log_fname, index=False)
+            st.success(f"Decisões salvas em {log_fname}")
 
-# ---------------------------
-# Comparação MV x Produção
-# ---------------------------
-if all_extracted:
-    combined = pd.concat(all_extracted, ignore_index=True).fillna({"codigo":None})
-    summary = combined.groupby("codigo", dropna=False).agg({
-        "descricao": lambda x: "; ".join(pd.unique(x.dropna().astype(str))) if x.notna().any() else None,
-        "quant_total": "sum"
-    }).reset_index()
+# ---------------------- Export & PDF ----------------------
+with tab4:
+    st.header("📦 Export & PDF")
+    st.write("Gere arquivo Excel consolidado e um PDF resumo para auditoria.")
 
-    result = pd.merge(agg_mv, summary, how="outer", on="codigo", suffixes=("_mv","_fontes"))
-    result["quant_mv"] = result["quant_mv"].fillna(0).astype(int)
-    result["quant_total"] = result["quant_total"].fillna(0).astype(int)
-    result["diff_quant"] = result["quant_mv"] - result["quant_total"]
-    result["status"] = result["diff_quant"].apply(lambda d: "OK" if d==0 else "DIVERGENTE")
+    if st.button("Gerar Excel consolidado"):
+        out_name = 'comparativo_faturamento_avancado.xlsx'
+        with pd.ExcelWriter(out_name, engine='openpyxl') as writer:
+            mv.to_excel(writer, sheet_name='mv_raw', index=False)
+            lab.to_excel(writer, sheet_name='lab_raw', index=False)
+            agg_mv.to_excel(writer, sheet_name='agg_mv', index=False)
+            agg_lab.to_excel(writer, sheet_name='agg_lab', index=False)
+            comp_df.to_excel(writer, sheet_name='comparacao', index=False)
+            time_df.to_excel(writer, sheet_name='time_matches', index=False)
+            # audit log
+            if os.path.exists('audit_log.csv'):
+                pd.read_csv('audit_log.csv').to_excel(writer, sheet_name='audit_log', index=False)
+        with open(out_name, 'rb') as f:
+            st.download_button('Download Excel consolidado', f, file_name=out_name)
 
-    st.subheader("📊 Comparação MV x Produção")
-    st.dataframe(result.sort_values("diff_quant", ascending=False).head(200))
-else:
-    st.info("Nenhum relatório de produção encontrado.")
+    if st.button("Gerar PDF resumo para auditoria"):
+        pdf_name = 'relatorio_auditoria.pdf'
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+        pdf.set_font('Arial', 'B', 14)
+        pdf.cell(0, 8, 'Relatório de Auditoria - Comparativo MV x Laboratório', ln=True)
+        pdf.ln(4)
+        pdf.set_font('Arial', '', 10)
+        pdf.cell(0, 6, f'Data geração: {datetime.now()}', ln=True)
+        pdf.ln(6)
+        # key indicators
+        pdf.set_font('Arial', 'B', 12)
+        pdf.cell(0,6,'Indicadores principais', ln=True)
+        pdf.set_font('Arial', '', 10)
+        pdf.cell(0,6,f'Solicitados: {total_solicitados}', ln=True)
+        pdf.cell(0,6,f'Realizados: {total_realizados}', ln=True)
+        pdf.cell(0,6,f'Não realizados (abs): {not_realizados_abs}', ln=True)
+        pdf.cell(0,6,f'% Não realizados: {pct_not_realizados:.2f}%', ln=True)
+        pdf.ln(6)
+        # include top 10 divergences table text
+        pdf.set_font('Arial', 'B', 12)
+        pdf.cell(0,6,'Top divergências (amostra)', ln=True)
+        pdf.set_font('Arial', '', 9)
+        top10 = comp_df.sort_values('diff', ascending=False).head(10)
+        for _, r in top10.iterrows():
+            pdf.multi_cell(0,5,f"{r['exame_mv'][:80]} -- Sol: {r['qtd_mv']} Lab: {r['qtd_lab']} Dif: {r['diff']}")
+        pdf.output(pdf_name)
+        with open(pdf_name, 'rb') as f:
+            st.download_button('Download PDF da auditoria', f, file_name=pdf_name)
 
-# ---------------------------
-# Comparação Nominal (Pacientes)
-# ---------------------------
-if nominal_dfs and cand_name:
-    st.subheader("🧑‍⚕️ Conferência Nominal de Pacientes")
+st.sidebar.markdown('---')
+st.sidebar.write('Versão: Avançada — entregue pelo assistente')
 
-    nominal = pd.concat(nominal_dfs, ignore_index=True)
-    col_paciente = next((c for c in nominal.columns if "paciente" in str(c).lower()), None)
-    lista_mv = mv_work["nome_mv"].dropna().unique().tolist()
-    lista_nominal = nominal[col_paciente].dropna().unique().tolist()
-
-    st.write(f"Total nomes MV: {len(lista_mv)} | Total nomes Relatório Nominal: {len(lista_nominal)}")
-
-    df_matches = fuzzy_match_list(lista_mv, lista_nominal, cutoff=fuzzy_cutoff)
-    st.write("🔎 Matching de pacientes (MV → Nominal):")
-    st.dataframe(df_matches.head(50))
-
-    ausentes = df_matches[df_matches["match"].isna()]
-    if not ausentes.empty:
-        st.warning("Pacientes no MV que não aparecem no Relatório Nominal:")
-        st.dataframe(ausentes)
-
-else:
-    st.info("Nenhum relatório nominal detectado.")
-
-# ---------------------------
-# Exportar
-# ---------------------------
-st.subheader("💾 Exportar relatório")
-export_name = st.text_input("Nome do arquivo", value="relatorio_conferencia")
-if st.button("Gerar Excel"):
-    dfs_export = {"mv_agregado": agg_mv}
-    if all_extracted:
-        dfs_export["comparacao"] = result
-        dfs_export["fontes_agregadas"] = summary
-    if nominal_dfs and cand_name:
-        dfs_export["nominal_matching"] = df_matches
-    excel_bytes = to_excel_bytes(dfs_export)
-    st.download_button("Download .xlsx", data=excel_bytes,
-                       file_name=f"{export_name}.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
